@@ -1783,6 +1783,65 @@ function erAddWord(i,j){
   jset('hw_er_words',w.slice(0,300));renderEr();
 }
 
+
+/* ---- 쪽 번호로 순서 맞추기 ---- */
+function erPageNo(v){
+  if(typeof v==='number'&&isFinite(v))return Math.round(v);
+  var m=/\d{1,4}/.exec(String(v==null?'':v));return m?parseInt(m[0],10):null;
+}
+function erOrder(arr){
+  // arr: 올린 순서. 쪽 번호가 보이는 쪽은 번호로, 안 보이는 쪽은 올린 순서상 이웃 쪽 번호 사이에 끼워 넣는다.
+  var n=arr.length,key=[];
+  arr.forEach(function(p,k){key[k]=p.n});
+  arr.forEach(function(p,k){
+    if(p.n!==null)return;
+    var a=null,b=null,i;
+    for(i=k-1;i>=0;i--)if(arr[i].n!==null){a=arr[i].n;break}
+    for(i=k+1;i<n;i++)if(arr[i].n!==null){b=arr[i].n;break}
+    key[k]=(a!==null&&b!==null)?(a+b)/2:(a!==null?a+0.5:(b!==null?b-0.5:k));
+  });
+  var idx=arr.map(function(_,k){return k});
+  idx.sort(function(x,y){return key[x]-key[y]||x-y});
+  var out=[],seen={};
+  idx.forEach(function(k){
+    var p=arr[k],sig=(p.n!==null?p.n:'?')+'|'+p.text.slice(0,30).toLowerCase().replace(/\W+/g,'');
+    if(p.n!==null&&seen[sig])return; // 같은 쪽을 두 번 찍은 경우 하나만
+    seen[sig]=1;out.push(p);
+  });
+  return out;
+}
+
+
+var P_ER_ORDER='너는 어린이 영어책 사진들의 순서를 바로잡는 도우미다. 아래는 사진마다 읽은 쪽 정보(id는 올린 순서)다. 일부 쪽은 쪽 번호(page)가 없다.\n'+
+'책에서 읽는 순서대로 id를 나열해라. 근거: 쪽 번호, 문장이 쪽 끝에서 다음 쪽 처음으로 이어지는지(end가 문장 중간에서 끊기면 이어지는 start 찾기), 챕터 제목(title)과 이야기 전개(앞뒤 사건·시간 순서), 그림 설명. 쪽 번호가 있는 쪽끼리는 반드시 번호 순서를 지켜라. 모든 id를 정확히 한 번씩 쓴다.\n'+
+'JSON만 출력(코드펜스 금지): {"order":[0,1,2],"reason":"한국어 한 줄"}';
+async function erOrderAI(key,model,arr){
+  var base=erOrder(arr);                       // 쪽 번호 + 이웃 기준 기본 순서
+  var missing=arr.some(function(p){return p.n===null});
+  var nums=arr.filter(function(p){return p.n!==null}).map(function(p){return p.n});
+  var dup=nums.some(function(v,i){return nums.indexOf(v)!==i});
+  if(arr.length<2||(!missing&&!dup)){return base}
+  try{
+    var info=arr.map(function(p,k){var t=p.text.replace(/\s+/g,' ');return {id:k,page:p.n,title:p.title||'',start:t.slice(0,200),end:t.slice(-200),illus:p.illus||''}});
+    var res=await callApi(key,model,[{type:'text',text:P_ER_ORDER+'\n\n'+JSON.stringify(info)}],1500);
+    var d=parseJson(res.text),ord=d&&d.order;
+    if(!Array.isArray(ord)||ord.length!==arr.length)throw new Error('bad');
+    var seen={},ok=true;ord.forEach(function(v){if(typeof v!=='number'||v<0||v>=arr.length||seen[v])ok=false;seen[v]=1});
+    if(!ok)throw new Error('bad');
+    var last=-Infinity;ord.forEach(function(v){var n=arr[v].n;if(n!==null){if(n<last)ok=false;last=n}});
+    if(!ok)throw new Error('bad');            // 쪽 번호와 모순되면 기본 순서 사용
+    var out=[],sg={};
+    ord.forEach(function(v){
+      var p=arr[v],sig=(p.n!==null?p.n:'?')+'|'+p.text.slice(0,30).toLowerCase().replace(/\W+/g,'');
+      if(p.n!==null&&sg[sig])return;sg[sig]=1;
+      if(p.n===null)p.how='ctx';out.push(p);
+    });
+    return out;
+  }catch(e){
+    base.forEach(function(p){if(p.n===null)p.how='near'});return base;
+  }
+}
+
 /* ---- 생성 파이프라인 ---- */
 async function erPool(items,n,fn){
   var i=0;await Promise.all(Array.apply(null,Array(Math.min(n,items.length))).map(async function(){
@@ -1802,12 +1861,12 @@ async function erRun(){
       var d=parseJson(res.text);
       if(!d){res=await callApi(key,model,[{type:'image',source:{type:'base64',media_type:'image/jpeg',data:img.split(',')[1]}},{type:'text',text:P_ER_OCR}],4000);d=parseJson(res.text)}
       if(!d)throw new Error((k+1)+'번째 사진의 글자를 읽지 못했어요. 더 밝고 반듯하게 다시 찍어 주세요.');
-      ocr[k]={n:(typeof d.page==='number'?d.page:null),title:d.title||'',text:String(d.text||'').trim(),illus:d.illus||'',unsure:d.unsure||[],k:k};
+      ocr[k]={n:erPageNo(d.page),title:d.title||'',text:String(d.text||'').trim(),illus:d.illus||'',unsure:d.unsure||[],k:k};
       done++;ER.prog='📷 책 글자를 읽는 중이에요 ('+done+'/'+n+')';renderEr();
     });
     ocr=ocr.filter(Boolean);
-    if(ocr.every(function(p){return p.n!==null}))ocr.sort(function(a,b){return a.n-b.n});
-    var pages=ocr.filter(function(p){return p.text.length>3});
+    ER.prog='🔢 쪽 순서를 맞추는 중이에요';renderEr();
+    var pages=await erOrderAI(key,model,ocr.filter(function(p){return p.text.length>3}));
     if(!pages.length)throw new Error('사진에서 영어 글을 찾지 못했어요. 글이 있는 쪽을 가까이서 반듯하게 찍어 주세요.');
     // 쪽 끝에서 끊긴 문장은 다음 쪽으로 이어 붙인다
     for(var q=0;q<pages.length-1;q++){
@@ -1819,7 +1878,7 @@ async function erRun(){
     }
     var title=(ocr.map(function(p){return p.title}).filter(Boolean)[0])||'영어책 읽기';
     ER.g={id:Date.now().toString(36),d:todayKey(),title:title,book:null,
-      pages:pages.map(function(p){return {n:p.n,text:p.text,illus:p.illus,unsure:p.unsure,sents:erMakeSents(p.text),vocab:null,points:null,read:''}})};
+      pages:pages.map(function(p){return {n:p.n,how:p.how||'',text:p.text,illus:p.illus,unsure:p.unsure,sents:erMakeSents(p.text),vocab:null,points:null,read:''}})};
     erSave();ER.mode='guide';
     await erFill();
   }catch(e){ER.err=e.message||String(e);ER.busy=false;if(!ER.g){ER.mode='up';renderEr()}else{ER.mode='guide';renderEr()}}
@@ -1922,7 +1981,7 @@ function renderEr(){
     '<div style="display:flex;gap:8px;flex-wrap:wrap" class="no-print"><button data-act="chunk" class="'+(ER.chunk?'pri':'')+'">'+(ER.chunk?'✂️ 끊어 읽기 끄기':'✂️ 끊어 읽기 켜기')+'</button><button data-act="print">📄 PDF 저장</button><button data-act="new">＋ 새 책 쪽 올리기</button></div>'+
     (ER.err?'<div class="err">'+esc(ER.err)+'</div><button class="pri no-print" data-act="retry" style="width:100%;margin-top:8px">🔄 다시 만들기</button>':'')+'</div>';
   g.pages.forEach(function(p,pi){
-    h+='<div class="card"><div class="rv-big">'+(p.n?p.n+'쪽':(pi+1)+'번째 쪽')+'</div>';
+    h+='<div class="card"><div class="rv-big">'+(p.n?p.n+'쪽':(pi+1)+'번째 쪽 <small style="color:#667">('+(p.how==='ctx'?'쪽 번호가 안 보여서 글의 흐름을 보고 순서를 맞췄어요':'쪽 번호가 안 보여서 앞뒤 쪽 사이에 넣었어요')+')</small>')+'</div>';
     if(p.illus)h+='<div class="hint">🖼 그림: '+esc(p.illus)+'</div>';
     if(p.unsure&&p.unsure.length)h+='<div class="par">⚠️ 글자가 흐려 확실하지 않은 말: '+p.unsure.map(esc).join(', ')+' (책과 비교해 보세요)</div>';
     h+='<div class="no-print" style="margin:6px 0"><button data-act="allko" data-i="'+pi+'" data-v="1" style="font-size:12px;padding:4px 10px">뜻 모두 보기</button> <button data-act="allko" data-i="'+pi+'" data-v="0" style="font-size:12px;padding:4px 10px">모두 가리기</button></div>';
